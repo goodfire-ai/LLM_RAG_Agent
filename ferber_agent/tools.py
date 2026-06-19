@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.parse
 
 import requests
@@ -28,21 +29,27 @@ class RagTool:
         self.embed_model = embed_model
         self.k = k
         self._coll = None
+        self._lock = threading.Lock()
 
     def _collection(self):
         if self._coll is None:
-            import chromadb
-            from chromadb.utils import embedding_functions
+            with self._lock:
+                if self._coll is None:
+                    import chromadb
+                    from chromadb.utils import embedding_functions
 
-            ef = embedding_functions.OpenAIEmbeddingFunction(
-                api_key=os.environ["OPENAI_API_KEY"], model_name=self.embed_model)
-            client = chromadb.PersistentClient(path=self.chroma_dir)
-            self._coll = client.get_collection(name=self.collection_name, embedding_function=ef)
+                    ef = embedding_functions.OpenAIEmbeddingFunction(
+                        api_key=os.environ["OPENAI_API_KEY"], model_name=self.embed_model)
+                    client = chromadb.PersistentClient(path=self.chroma_dir)
+                    self._coll = client.get_collection(
+                        name=self.collection_name, embedding_function=ef)
         return self._coll
 
     def query(self, query: str, k: int | None = None) -> list[dict]:
         k = k or self.k
-        res = self._collection().query(query_texts=[query], n_results=k)
+        coll = self._collection()
+        with self._lock:
+            res = coll.query(query_texts=[query], n_results=k)
         docs = res["documents"][0]
         metas = res["metadatas"][0]
         dists = res.get("distances", [[None] * len(docs)])[0]
