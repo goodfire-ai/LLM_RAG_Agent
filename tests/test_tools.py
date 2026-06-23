@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 
 from ferber_agent import tools
+from ferber_agent.agent import FerberAgent
 
 
 def test_tool_schemas_include_imaging():
@@ -62,6 +63,22 @@ def test_calculate_progression_ratio():
     assert tools.calculate("120 / 30") == "4.0"
     assert tools.calculate("2 ** 10") == "1024"
     assert "error" in tools.calculate("__import__('os')").lower()
+
+
+def test_imaging_schemas_filtered_without_images():
+    # Imaging tools present in the tuple but no image map -> filtered out (MTBBench parity).
+    agent = FerberAgent(chroma_dir="/tmp/nonexistent_index",
+                        tools=("rag", "oncokb", "pubmed", "calculate",
+                               "radiology_report", "medsam", "histology_classifier"))
+    agent._images = {}
+    active = agent._active_tools()
+    assert "radiology_report" not in active and "medsam" not in active
+    assert "histology_classifier" not in active
+    assert set(active) == {"rag", "oncokb", "pubmed", "calculate"}
+    # with an image map, imaging tools are exposed
+    agent._images = {"September2023.png": "/abs/Xing_1.jpg"}
+    active2 = agent._active_tools()
+    assert "radiology_report" in active2 and "medsam" in active2
 
 
 def test_oncokb_endpoint_selection(monkeypatch):

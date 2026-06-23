@@ -105,6 +105,15 @@ class FerberAgent:
         # per-call image map (referenced filename -> absolute path); set in answer()
         self._images: dict[str, str] = {}
 
+    _IMAGING_TOOLS = ("radiology_report", "medsam", "histology_classifier")
+
+    def _active_tools(self) -> tuple[str, ...]:
+        """Imaging-tool schemas are exposed only when the call carries an image map, so the
+        text-only genomic track (e.g. MTBBench) is unaffected and behavior-preserving."""
+        if self._images:
+            return self.tool_names
+        return tuple(t for t in self.tool_names if t not in self._IMAGING_TOOLS)
+
     def _retrieve(self, query: str) -> list[dict]:
         """Cosine retrieval, then Cohere rerank when enabled (else cosine order)."""
         hits = self._rag.query(query)
@@ -149,9 +158,10 @@ class FerberAgent:
     def answer(self, context: str, question: str,
                images: dict[str, str] | None = None) -> FerberResult:
         self._images = dict(images or {})
-        schemas = tool_schemas(self.tool_names)
+        active = self._active_tools()
+        schemas = tool_schemas(active)
         messages: list[dict] = [
-            {"role": "system", "content": _system_prompt(self.tool_names)},
+            {"role": "system", "content": _system_prompt(active)},
             {"role": "user", "content": f"Patient context:\n{context}\n\nQuestion:\n{question}"},
         ]
         tool_calls: list[dict] = []

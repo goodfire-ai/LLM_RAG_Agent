@@ -5,6 +5,54 @@
 
 ![Local Image](./overview.png)
 
+---
+
+## `ferber_agent` — modernized, pip-installable package
+
+`ferber_agent/` is a modern reimplementation of this agent's *method* on the current OpenAI
+SDK (function-calling) + chromadb, with a frontier backbone (default `gpt-5.1`). The original
+`RAGent/DSPY/` code (dspy + llama-index 0.9 + vendored agent + cohere) is preserved above for
+reference but its dependencies are deprecated. Install:
+
+```bash
+pip install -e .              # core text track (API/CPU, no torch)
+pip install -e .[imaging]     # + radiology_report (vision) and medsam (torch + transformers)
+pip install -e .[rerank]      # + Cohere reranking
+```
+
+```python
+from ferber_agent import FerberAgent
+agent = FerberAgent(chroma_dir="/path/to/chroma", rerank=True,
+                    tools=("rag","oncokb","pubmed","calculate",
+                           "radiology_report","medsam","histology_classifier"))
+res = agent.answer(context, question, images={"September2023.png": "/abs/Xing_1.jpg"})
+```
+
+### Tool status
+| Tool | Status | Notes |
+|------|--------|-------|
+| `rag` | ✓ | guideline retrieval from a Chroma index (OpenAI embeddings) |
+| `rerank` | ✓ | real Cohere `rerank-english-v3.0`; **cosine-only fallback** without `COHERE_API_KEY` |
+| `oncokb` | ✓ | prod endpoint with `ONCOKB_API_TOKEN`, else the public **demo** endpoint (common variants only) |
+| `pubmed` | ✓ | NCBI E-utilities |
+| `calculate` | ✓ | safe arithmetic (e.g. lesion-area progression ratios) |
+| `radiology_report` | ✓ | GPT-4V-style structured report from a patient image (vision backbone) |
+| `medsam` | ✓ | MedSAM (transformers `SamModel`, Wang Lab HF mirror); bbox prompt → lesion area in px |
+| `histology_classifier` | ✗ **hard gap** | the in-house KRAS/BRAF/MSI H&E classifier was never released; returns an explicit "unavailable, use the molecular report" message |
+
+Imaging-tool schemas are only exposed when the call carries an `images` map, so the
+text-only genomic track is unaffected. `resolve_image` matches the model-supplied filename
+(vignette date-name *or* on-disk basename, extension-insensitive) to a path.
+
+### Faithfulness notes
+- **KRAS/BRAF/MSI**: not reproducible (proprietary, unreleased) — surfaced as an explicit gap,
+  never faked.
+- **OncoKB demo endpoint**: full annotations for common alterations (e.g. BRAF V600E → 30
+  treatments); rarer variants may return "Unknown" until a prod token is set.
+- **Reranking** degrades to cosine order without a Cohere key (flagged on the agent).
+
+---
+
 ## Software Requirements
 All experiments were run on an Apple MacBook Pro M2 Max 96GB 2023.
 No special hardware is required, if you wish to run certain models with hardware acceleration, it is recommended to have a CUDA-compatible GPU to speed up the process.
