@@ -6,8 +6,6 @@ Network/vision/MedSAM paths are covered by the live smoke run, not here.
 """
 from __future__ import annotations
 
-import os
-
 from ferber_agent import tools
 from ferber_agent.agent import FerberAgent
 
