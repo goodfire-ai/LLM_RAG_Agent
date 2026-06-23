@@ -13,6 +13,10 @@ dependencies = [
 
 [project.optional-dependencies]
 rerank = ["cohere>=5.0"]
+# Imaging tools: radiology_report needs only the OpenAI vision backbone (already a core
+# dep); medsam needs torch + transformers' SamModel + pillow. Heavy; installed only for the
+# multimodal ferber20 track and lazy-imported at tool-call time.
+imaging = ["torch>=2.0", "transformers>=4.40", "pillow>=10.0"]
 
 [build-system]
 requires = ["hatchling"]
