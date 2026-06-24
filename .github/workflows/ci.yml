@@ -3,8 +3,10 @@ name: ci
 # Runs on a CLEAN checkout (committed files only), so a missing source file or a broken
 # import surfaces here rather than in a fresh clone. Heavy deps (torch / transformers for
 # medsam, the live OpenAI/Chroma smoke) cannot run on a CPU CI runner; the offline tests
-# (tools, faithful pipeline, serial-vs-parallel equivalence, prompt fidelity) + import +
-# ruff are the meaningful regression guard for the package surface.
+# (tools, faithful pipeline, serial-vs-parallel equivalence, prompt fidelity, backend switch,
+# web search, retrieval engines) + import + ruff are the meaningful regression guard for the
+# package surface. The openai SDK is pure-python and light, so it is installed to let the
+# backend / web-search / retrieval-engine tests stub its clients.
 on:
   push:
     branches: [main, "agent/**"]
@@ -19,17 +21,21 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install light test deps
-        # tools.py needs requests; agent.py/chromadb/openai/cohere/torch are lazy-imported,
-        # so the offline tests run without the heavy/imaging/rerank extras.
-        run: pip install pytest ruff requests
+        # tools.py needs requests; chromadb/cohere/torch stay lazy-imported (heavy/imaging/rerank
+        # extras not installed). openai is pure-python and light, and the backend / web-search /
+        # retrieval tests stub its clients, so it is installed here.
+        run: pip install pytest ruff requests openai
       - name: Import the package from the committed tree
-        run: PYTHONPATH=. python -c "import ferber_agent, ferber_agent.tools, ferber_agent.agent, ferber_agent.faithful_prompts; print('import OK')"
+        run: PYTHONPATH=. python -c "import ferber_agent, ferber_agent.tools, ferber_agent.agent, ferber_agent.faithful_prompts, ferber_agent.retrieval, ferber_agent.usage; print('import OK')"
       - name: Lint
         run: ruff check ferber_agent tests scripts
-      - name: Offline tests (tools, faithful pipeline, equivalence, prompt fidelity)
+      - name: Offline tests (tools, faithful pipeline, equivalence, prompt fidelity, backends, web search, retrieval)
         run: >
           PYTHONPATH=. pytest -q
           tests/test_tools.py
           tests/test_faithful_pipeline.py
           tests/test_equivalence.py
           tests/test_prompt_fidelity.py
+          tests/test_backends.py
+          tests/test_web_search.py
+          tests/test_retrieval.py

@@ -10,9 +10,23 @@
 ## `ferber_agent` — modernized, pip-installable package
 
 `ferber_agent/` is a modern reimplementation of this agent's *method* on the current OpenAI
-SDK (function-calling) + chromadb, with a frontier backbone (default `gpt-5.1`). The original
-`RAGent/DSPY/` code (dspy + llama-index 0.9 + vendored agent + cohere) is preserved above for
-reference but its dependencies are deprecated. Install:
+SDK (function-calling / Responses) + chromadb, with a frontier backbone (default `gpt-5.1`).
+The original `RAGent/DSPY/` code (dspy + llama-index 0.9 + vendored agent + cohere) is preserved
+above for reference but its dependencies are deprecated.
+
+On top of the two pipeline modes (default / faithful), the agent exposes three orthogonal
+switches:
+
+- **Execution backend** (`backend`): `chat_completions` (default) · `responses_faithful` ·
+  `native_agentic` — *how* the OpenAI plumbing runs the pipeline.
+- **Web search** (`web_search`): an OpenAI-native web-search tool that replaces the
+  discontinued Google Custom Search the paper used.
+- **Retrieval engine** (`retrieval_engine`): `chroma_cosine` (default) · `chroma_cohere` ·
+  `openai_filesearch_responses` · `openai_filesearch_chat` — *how* faithful Stage-2 guideline
+  retrieval is done.
+
+All three default to the prior behavior (faithful chat-completions over cosine Chroma, web
+search off), so existing usage is unchanged. Install:
 
 ```bash
 pip install -e .              # core text track (API/CPU, no torch)
@@ -35,6 +49,7 @@ res = agent.answer(context, question, images={"September2023.png": "/abs/Xing_1.
 | `rerank` | ✓ | real Cohere `rerank-english-v3.0`; **cosine-only fallback** without `COHERE_API_KEY` |
 | `oncokb` | ✓ | prod endpoint with `ONCOKB_API_TOKEN`, else the public **demo** endpoint (common variants only) |
 | `pubmed` | ✓ | NCBI E-utilities |
+| `web_search` | ✓ | OpenAI-native web search (replaces the paper's discontinued Google Custom Search); off by default, enable with `web_search=True` |
 | `calculate` | ✓ | safe arithmetic (e.g. lesion-area progression ratios) |
 | `radiology_report` | ✓ | GPT-4V-style structured report from a patient image (vision backbone) |
 | `medsam` | ✓ | MedSAM (transformers `SamModel`, Wang Lab HF mirror); bbox prompt → lesion area in px |
@@ -81,6 +96,10 @@ print(res.citations, len(res.retrieved))
 
 | Knob (constructor / env) | Default | Effect |
 |---|---|---|
+| `backend` | `chat_completions` | execution backend: `chat_completions` / `responses_faithful` / `native_agentic` |
+| `web_search` / `FERBER_WEB_SEARCH` | off | enable the OpenAI-native web-search tool |
+| `retrieval_engine` | derived (`chroma_cosine`) | Stage‑2 retrieval engine (see below); unset → derived from `rerank` |
+| `vector_store_id` / `OPENAI_VECTOR_STORE_ID` | unset | OpenAI vector store for the `openai_filesearch_*` engines |
 | `n_subqueries` | 12 | max Stage‑2 subqueries fanned out for retrieval |
 | `retrieve_k` | 20 (40 in the paper track) | passages retrieved per subquery |
 | `rerank_top_n` | 10 | passages kept per subquery after Cohere rerank |
@@ -91,6 +110,85 @@ print(res.citations, len(res.retrieved))
 | `citation_workers` / `CITATION_WORKERS` | 12 | thread-pool width for citation checks |
 | `EMBED_CACHE_DIR` | unset | disk cache for query embeddings + reranked results (cross-process) |
 | `HISTOLOGY_LOOKUP` | bundled file | override the histology replay lookup JSON |
+
+### Execution backends
+
+`backend` selects *how* the OpenAI plumbing runs the pipeline. The faithful pipeline is
+identical across the first two (same verbatim prompts, same explicit stages) — only the
+transport differs:
+
+- **`chat_completions`** (default) — chat.completions function-calling. Web search, when
+  enabled, is a callable function tool (a nested Responses `web_search` call).
+- **`responses_faithful`** — the SAME explicit faithful stages over the Responses API, carrying
+  reasoning items across tool calls and attaching the hosted `web_search` tool directly.
+- **`native_agentic`** — OpenAI's Responses runtime drives the loop itself (the faithful
+  evidence tools + a callable `rag` tool + hosted web search), rather than the explicit staged
+  pipeline. This is a *different* agent, not the paper-faithful pipeline.
+
+```python
+agent = FerberAgent(chroma_dir="/path/to/chroma", faithful=True,
+                    backend="responses_faithful", web_search=True)
+```
+
+Per-rollout token usage, hosted-tool calls, latency, and an approximate USD cost are tracked on
+`agent._usage` (see `ferber_agent/usage.py`); `agent._usage.summary()` returns a serializable
+record after each `answer()`.
+
+### Web search
+
+The paper's agent had a `google_search` tool (a llama-hub `GoogleSearchToolSpec` agent keyed on
+`GOOGLE_API_KEY` / `GOOGLE_SEARCH_ENGINE`). The Google Custom Search whole-web endpoint was
+discontinued, so the capability is restored via OpenAI's native web search (`web_search` in
+`ferber_agent/tools.py`): a nested Responses `web_search` call that returns a source-cited
+summary plus the cited URLs. It is off by default; enable with `web_search=True` (or
+`FERBER_WEB_SEARCH=1`). It degrades to an explicit message — never raises — on any search
+failure.
+
+### Retrieval engines
+
+`retrieval_engine` selects how faithful Stage‑2 guideline retrieval is done (see
+`ferber_agent/retrieval.py`). Every engine implements the same `retrieve(query, retrieve_k,
+top_n)` contract and returns normalized passage dicts:
+
+| Engine | What it does |
+|---|---|
+| `chroma_cosine` (default) | Chroma top‑`retrieve_k` cosine → top‑`rerank_top_n` (no rerank) |
+| `chroma_cohere` | Chroma cosine → Cohere rerank → top‑`rerank_top_n` (cosine-only without `COHERE_API_KEY`) |
+| `openai_filesearch_responses` | OpenAI Responses `file_search` over a vector store of the source docs |
+| `openai_filesearch_chat` | the SAME vector store, retrieved via a chat.completions `file_search` function-tool wrapper |
+
+When `retrieval_engine` is unset it is derived from the legacy `rerank` flag (`chroma_cohere`
+if `rerank=True` and a Cohere key is present, else `chroma_cosine`), so existing callers are
+unchanged. The two `chroma_*` engines delegate to the cached `RagTool.retrieve_reranked` path,
+so they reuse the embedding/rerank cache and produce output identical to the inline Chroma
+retrieval (the result-preserving speedup below applies to all engines via the same parallel
+fan-out).
+
+**Recommendation (from experiment #24):** the four engines were tied on answer quality on
+ferber20, so `chroma_cosine` — the cheapest, with no Cohere dependency and no OpenAI vector
+store to maintain — is the recommended default. The `chroma_cohere` and `openai_filesearch_*`
+engines are available for comparison but did not improve the result.
+
+#### Building the vector store (for the `openai_filesearch_*` engines)
+
+The file_search engines query an OpenAI vector store of the guideline corpus. Build one with
+`scripts/build_vector_store.py` (pure network I/O; needs `OPENAI_API_KEY`):
+
+```bash
+python scripts/build_vector_store.py --corpus-dir /path/to/corpus --out vector_store.json
+# corpus = {source}.jsonl files with a clean_text field (the same corpus the Chroma index uses)
+```
+
+It uploads one file per document with `{source, title, doc_id}` attributes (so retrieved chunks
+carry provenance), waits for indexing, and records the store id. Then point the agent at it:
+
+```python
+agent = FerberAgent(chroma_dir="/path/to/chroma", faithful=True,
+                    retrieval_engine="openai_filesearch_responses",
+                    vector_store_id="vs_...")  # or OPENAI_VECTOR_STORE_ID
+```
+
+The build is idempotent: an already-fully-indexed recorded store is reused unless `--force`.
 
 ### Result-preserving speedup
 
@@ -135,24 +233,31 @@ They are generated by `scripts/extract_prompts.py` (AST extraction, no retyping)
 
 ### Tests & scripts
 - `tests/test_tools.py`, `tests/test_faithful_pipeline.py`, `tests/test_equivalence.py`,
-  `tests/test_prompt_fidelity.py` — all **hermetic** (no OpenAI / Chroma / Cohere / GPU); run
-  with `PYTHONPATH=. pytest tests/test_tools.py tests/test_faithful_pipeline.py
-  tests/test_equivalence.py tests/test_prompt_fidelity.py`. `tests/test_smoke.py` is a live
-  end-to-end check (needs `OPENAI_API_KEY` and builds a tiny in-memory index).
+  `tests/test_prompt_fidelity.py`, `tests/test_backends.py`, `tests/test_web_search.py`,
+  `tests/test_retrieval.py` — all **hermetic** (no OpenAI / Chroma / Cohere / GPU; OpenAI
+  clients are stubbed). Run with `PYTHONPATH=. pytest tests/` (skipping `test_smoke.py`, which
+  is a live end-to-end check needing `OPENAI_API_KEY`). The backend / web-search /
+  retrieval-engine switches each have unit tests covering construction, the exposed tool set,
+  and a mocked file_search path.
 - `scripts/extract_prompts.py` — regenerate the verbatim prompt module from `RAGent/DSPY`.
 - `scripts/build_histology_lookup.py` — rebuild the histology replay lookup from a
   supplementary text (needs `ANTHROPIC_API_KEY`; `pip install -e .[histology]`).
+- `scripts/build_vector_store.py` — build the OpenAI vector store for the `openai_filesearch_*`
+  retrieval engines (needs `OPENAI_API_KEY`).
 
 ### Dependencies & provenance
 All runtime dependencies are **public** (openai, chromadb, requests, tiktoken; cohere, torch +
 transformers + the `wanglab/medsam-vit-base` weights, and anthropic only for the optional
 extras). There are no internal/private package dependencies.
 
-This package synthesizes the validated code from two research experiments: a paper-faithful
+This package synthesizes the validated code from several research experiments: a paper-faithful
 rebuild (faithful 79.4% vs bare 64.0% completeness, +15.3pp, bootstrap CI [+6.2, +24.5]) and a
-validated result-preserving speedup (3.7× faster faithful generation; the effect reproduced at
-+17.4pp, Wilcoxon p=0.0035, 16/20 cases favoring faithful). The full ferber20 numeric
-evaluation lives with those experiments and is not re-run here.
+validated result-preserving speedup (3.7× faster faithful generation; +17.4pp, Wilcoxon
+p=0.0035, 16/20 cases favoring faithful); the **execution-backend switch + web-search tool**
+(experiment #21, which decomposed the native-plumbing options) and the **retrieval-engine
+switch + file_search engines + vector-store builder** (experiment #24, which found the four
+retrieval engines tied on ferber20 — hence `chroma_cosine` as the cheapest tied-best default).
+The full ferber20 numeric evaluation lives with those experiments and is not re-run here.
 
 ---
 
