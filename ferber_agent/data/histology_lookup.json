@@ -1,0 +1,264 @@
+{
+  "dataset": "ferber20",
+  "n_cases": 20,
+  "model": "claude-sonnet-4-6",
+  "source": "ferber_supp.txt",
+  "cases": {
+    "Adams": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.48
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.03
+        }
+      },
+      "source": "All three markers were reported by the checkmutations image-based prediction tool applied to Mrs. Adams' histopathology images, as documented in the Tool Results section for patient A."
+    },
+    "Brown": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "mutated",
+          "probability": 0.68
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.03
+        }
+      },
+      "source": "The checkmutations tool reported all three markers from histopathology images of Mrs. Brown, as detailed in the Tool Results section for patient B."
+    },
+    "Doe": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSI-High",
+          "probability": 0.95
+        },
+        "KRAS": {
+          "label": "mutated",
+          "probability": 0.52
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.48
+        }
+      },
+      "source": "All three markers were reported by the 'checkmutations' tool from histopathology images for Mr. Doe (patient D), as explicitly cited with [Tool] tags in the model response and confirmed in the Tool Results section."
+    },
+    "Garcia": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations tool was not run for Mr. Garcia; the agent only used segmentation and calculation tools, and explicitly requested histologic images at the end to perform genetic modeling in the future."
+    },
+    "Lee": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations image-based prediction tool was never run for Mr. Lee; his KRAS G12C status came from molecular analysis of the tumor (patient record), and the tool results section shows only a radiology report comparison and a Google search."
+    },
+    "Lopez": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.27
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.02
+        }
+      },
+      "source": "The checkmutations tool was run with patient ID 'AA-21-C' on histopathology images, as reported in the Tool Results section for Lopez."
+    },
+    "Smith": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.96
+        },
+        "KRAS": {
+          "label": "mutated",
+          "probability": 0.52
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.03
+        }
+      },
+      "source": "The checkmutations tool analyzed histopathology images of patient B13-22A (Mrs. Smith) and reported MSS with probability 0.96, KRAS mutated with probability 0.52, and BRAF wild-type with probability 0.03, as documented in the Tool Results section for patient S."
+    },
+    "Taylor": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations tool was not run for Mr. Taylor; only a radiology report tool was used, and the model explicitly requested histopathology images to perform genetic modeling in a future step."
+    },
+    "Williams": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSI-High",
+          "probability": 0.68
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.44
+        },
+        "BRAF": {
+          "label": "mutated",
+          "probability": 0.7
+        }
+      },
+      "source": "All three markers were reported by the checkmutations image-based prediction tool in the W (Williams) Tool Results section of the supplementary."
+    },
+    "Xing": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.89
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.29
+        },
+        "BRAF": {
+          "label": "mutated",
+          "probability": 0.74
+        }
+      },
+      "source": "All three markers were reported by the 'checkmutations' tool applied to histopathology images for patient ID X-09.22, as documented in the Tool Results section for patient X (Ms. Xing)."
+    },
+    "Zu": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations tool encountered an error when run for Mr. Zu and did not return any predictions for MSI, KRAS, or BRAF."
+    },
+    "Adomako": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "mutated",
+          "probability": 0.68
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.05
+        }
+      },
+      "source": "The checkmutations tool applied to histopathology images reported MSS (prob 0.97), KRAS mutated (prob 0.68), and BRAF wild-type (prob 0.05) in the Tool Results section for patient Adomako."
+    },
+    "Anderson": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.48
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.03
+        }
+      },
+      "source": "The checkmutations tool reported all three markers from Mrs. Anderson's histopathology images, as documented in the 'An' Tool Results section of the supplementary."
+    },
+    "Chen": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.27
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.03
+        }
+      },
+      "source": "The checkmutations tool analyzed Mrs. Chen's histopathology images using patient ID 'XX-03AY' and reported MSS (0.97), BRAF wild-type (0.03), and KRAS wild-type (0.27) in the 'Ch' Tool Results section."
+    },
+    "Davis": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSS",
+          "probability": 0.97
+        },
+        "KRAS": {
+          "label": "mutated",
+          "probability": 0.68
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.05
+        }
+      },
+      "source": "All three markers were reported by the checkmutations tool applied to Mr. Davis's histopathology images, as documented in the 'Da' Tool Results section."
+    },
+    "Johnson": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations tool was never run for Mrs. Johnson; only a radiology report tool was used (and it encountered a folder error), with no genetic marker predictions reported."
+    },
+    "Martinez": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations image-based prediction tool was not run for Mr. Martinez; his KRAS G12D status came from his clinical history, and only segmentation and OncoKB tools were used in his case."
+    },
+    "Miller": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations tool was not run for Mr. Miller; only MRI segmentation and a treatment options search were used, and the model explicitly requested histopathology images to perform genetic analysis in the future."
+    },
+    "Patel": {
+      "available": false,
+      "predictions": {},
+      "source": "The checkmutations tool encountered an error when run for Mrs. Patel and returned no predictions for MSI, KRAS, or BRAF."
+    },
+    "Zhang": {
+      "available": true,
+      "predictions": {
+        "MSI": {
+          "label": "MSI-High",
+          "probability": 0.93
+        },
+        "KRAS": {
+          "label": "wild-type",
+          "probability": 0.42
+        },
+        "BRAF": {
+          "label": "wild-type",
+          "probability": 0.18
+        }
+      },
+      "source": "The 'checkmutations' image-based prediction tool was run on Mrs. Zhang's histopathology images using her system ID 'AA-02-xx2', as reported in the Tool Results section for patient 'Zh'."
+    }
+  }
+}
