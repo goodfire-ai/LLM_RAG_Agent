@@ -3,26 +3,42 @@
 A modernized reimplementation of the Ferber et al. (Nature Cancer 2025) RAG agent's
 method. The original used dspy + llama-index 0.9 + a vendored OpenAI agent + cohere rerank;
 those APIs are deprecated/removed, so the *method* is reimplemented on the current OpenAI SDK
-(function-calling) + chromadb. The agent exposes two modes:
+(function-calling / Responses) + chromadb.
+
+Two pipeline modes:
 
 Default mode (``faithful=False``) — a compact two-stage loop:
   Stage 1 — autonomous tool use: the model decides which tools to call (OncoKB genomic
-            annotation, PubMed, guideline RAG, calculate) and gathers evidence.
+            annotation, PubMed, guideline RAG, calculate, web search) and gathers evidence.
   Stage 2 — RAG-grounded answer: guideline passages are retrieved and the model produces a
             grounded clinical answer citing them.
 
 Faithful mode (``faithful=True``) — the paper's full multi-stage pipeline, with the verbatim
 upstream prompt strings (see ``faithful_prompts``):
-  Stage 1 — autonomous tool gathering (oncokb / pubmed / calculate, plus imaging when images
-            are supplied); guideline ``rag`` is NOT a callable tool here.
+  Stage 1 — autonomous tool gathering (oncokb / pubmed / calculate, web search, plus imaging
+            when images are supplied); guideline ``rag`` is NOT a callable tool here.
   Stage 2 — mandatory guideline grounding: Search subquery fan-out (up to ``n_subqueries``)
-            -> retrieve top-k per subquery -> Cohere rerank top-n -> dedup union ->
+            -> retrieve top-k per subquery via the configured engine -> dedup union ->
             AnswerStrategy -> GenerateCitedResponse -> optional one-pass citation
             self-evaluation -> Suggestions.
 
+Three execution backends select *how* the OpenAI plumbing runs the pipeline:
+  ``chat_completions``    chat.completions function-calling (the default); web search is a
+                          nested function tool.
+  ``responses_faithful``  the SAME explicit faithful stages over the Responses API, carrying
+                          reasoning items across tool calls and using the hosted web_search tool.
+  ``native_agentic``      OpenAI's Responses runtime drives the loop itself (the domain tools +
+                          hosted web search), rather than the explicit staged pipeline.
+
+The guideline retrieval used in faithful Stage 2 is pluggable via ``retrieval_engine`` (see
+:mod:`ferber_agent.retrieval`): ``chroma_cosine`` (default) / ``chroma_cohere`` /
+``openai_filesearch_responses`` / ``openai_filesearch_chat``.
+
 The independent per-subquery retrievals and per-statement citation checks fan out across a
 thread pool with order-preserving reassembly, so the concurrency is result-preserving (see
-``_map_parallel``). Reranking falls back to cosine-only without ``COHERE_API_KEY``.
+``_map_parallel``). For the chroma engines the embedding/rerank cache makes that fan-out exact
+and the agent reproducible. Reranking (``chroma_cohere``) falls back to cosine-only without
+``COHERE_API_KEY``.
 """
 from __future__ import annotations
 
@@ -34,6 +50,8 @@ from functools import lru_cache
 
 from . import faithful_prompts as _fp
 from .result import FerberResult
+from .retrieval import make_engine
+from .usage import UsageAccumulator
 from .tools import (
     RagTool,
     calculate,
@@ -51,7 +69,18 @@ from .tools import (
     rerank_passages,
     resolve_image,
     tool_schemas,
+    web_search,
+    _collect_url_citations,
 )
+
+# Execution backends (which OpenAI plumbing runs the pipeline). The faithful pipeline is
+# identical across chat_completions and responses_faithful (same verbatim prompts, same explicit
+# stages); only the transport differs. native_agentic is a different agent (the runtime drives
+# the loop).
+BACKEND_CHAT = "chat_completions"
+BACKEND_RESPONSES = "responses_faithful"
+BACKEND_NATIVE = "native_agentic"
+VALID_BACKENDS = (BACKEND_CHAT, BACKEND_RESPONSES, BACKEND_NATIVE)
 
 _SYSTEM_BASE = (
     "You are an expert molecular tumor board assistant. Given a patient's clinical and "
@@ -113,6 +142,33 @@ def _create(model: str, messages: list[dict], tools=None, max_tokens: int = 6000
     return _client().chat.completions.create(**kw)
 
 
+def _responses_create(model: str, *, instructions: str | None = None, input,
+                      tools=None, max_tokens: int = 6000):
+    """One Responses-API call (responses_faithful / native_agentic backends). ``input`` is a
+    string or a list of input items (the reasoning-preserving tool loop passes prior output
+    items back). Hosted tools (e.g. ``{"type": "web_search"}``) and function tools may be mixed
+    in ``tools``."""
+    kw: dict = {"model": model, "input": input, "max_output_tokens": max_tokens}
+    if instructions is not None:
+        kw["instructions"] = instructions
+    if tools:
+        kw["tools"] = tools
+        kw["tool_choice"] = "auto"
+    return _client().responses.create(**kw)
+
+
+def _responses_function_tools(schemas: list[dict]) -> list[dict]:
+    """Flatten chat.completions function schemas ({"type":"function","function":{...}}) into the
+    Responses tool shape ({"type":"function", name, description, parameters} at top level)."""
+    out = []
+    for s in schemas:
+        fn = s.get("function", s)
+        out.append({"type": "function", "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {"type": "object", "properties": {}})})
+    return out
+
+
 class FerberAgent:
     def __init__(self, chroma_dir: str, collection: str = "oncology_db",
                  llm_model: str = "gpt-5.1", embed_model: str = "text-embedding-3-large",
@@ -122,7 +178,23 @@ class FerberAgent:
                  faithful: bool = False, n_subqueries: int = 12,
                  max_function_calls: int = 10, synth_max_tokens: int = 4096,
                  agent_temp: float = 0.2, rag_temp: float = 0.1,
-                 citation_selfeval: bool | None = None):
+                 citation_selfeval: bool | None = None,
+                 backend: str = BACKEND_CHAT, web_search: bool | None = None,
+                 retrieval_engine: str | None = None,
+                 vector_store_id: str | None = None):
+        # which OpenAI plumbing executes the pipeline (see VALID_BACKENDS).
+        if backend not in VALID_BACKENDS:
+            raise ValueError(f"unknown backend {backend!r}; expected one of {VALID_BACKENDS}")
+        self.backend = backend
+        # Web search replaces the discontinued google_search. On the chat backend it is a
+        # callable function tool (a nested Responses call); on the Responses backends the hosted
+        # web_search tool is attached directly on the model loop.
+        self.web_search = (bool(os.environ.get("FERBER_WEB_SEARCH"))
+                           if web_search is None else bool(web_search))
+        # per-rollout usage / cost / latency (reset at the start of each answer()).
+        self._usage = UsageAccumulator()
+        self.chroma_dir = chroma_dir
+        self.collection = collection
         self.llm_model = llm_model
         self.embed_model = embed_model
         self.tool_names = tuple(tools)
@@ -153,8 +225,28 @@ class FerberAgent:
                             k=(retrieve_k if not faithful else self.retrieve_k),
                             embed_cache_dir=os.environ.get("EMBED_CACHE_DIR")) \
             if (chroma_dir and (faithful or "rag" in self.tool_names)) else None
+        # Pluggable Stage-2 guideline-retrieval engine. When unset, the engine is derived from
+        # the legacy ``rerank`` flag so existing behavior is unchanged: rerank -> chroma_cohere,
+        # else chroma_cosine. An explicit ``retrieval_engine`` overrides that. The chroma engines
+        # reuse the RagTool above (and its embedding/rerank cache); the openai_filesearch_* engines
+        # query an OpenAI vector store of the same source documents.
+        if retrieval_engine is None:
+            retrieval_engine = "chroma_cohere" if self.rerank else "chroma_cosine"
+        self.retrieval_engine = retrieval_engine
+        self.vector_store_id = vector_store_id or os.environ.get("OPENAI_VECTOR_STORE_ID")
+        self._build_engine()
         # per-call image map (referenced filename -> absolute path); set in answer()
         self._images: dict[str, str] = {}
+
+    def _build_engine(self) -> None:
+        """(Re)build the retrieval engine from the current configuration and ``self._rag``.
+
+        Called from ``__init__``; tests that swap ``self._rag`` for a stub call it again so the
+        engine wraps the stub."""
+        self._engine = make_engine(
+            self.retrieval_engine, chroma_dir=self.chroma_dir, collection=self.collection,
+            embed_model=self.embed_model, vector_store_id=self.vector_store_id,
+            llm_model=self.llm_model, rag=self._rag)
 
     _IMAGING_TOOLS = ("radiology_report", "medsam", "histology_classifier")
 
@@ -168,18 +260,53 @@ class FerberAgent:
     def _faithful_tools(self) -> tuple[str, ...]:
         """Faithful callable tool set: the patient-evidence tools (oncokb/pubmed/calculate +
         imaging when images are present). Guideline ``rag`` is NOT callable — it is the
-        mandatory Stage-2 grounding step in the published method."""
+        mandatory Stage-2 grounding step in the published method. On the chat backend web_search
+        is added as a callable function tool; on the Responses backends the hosted web_search
+        tool is attached directly instead (see _responses_stage1)."""
         base = ["oncokb", "pubmed", "calculate"]
         if self._images:
             base += ["radiology_report", "medsam", "histology_classifier"]
+        if self.web_search and self.backend == BACKEND_CHAT:
+            base.append("web_search")
         return tuple(base)
 
     def _retrieve(self, query: str) -> list[dict]:
-        """Cosine retrieval, then Cohere rerank when enabled (else cosine order)."""
+        """Single-query retrieval for default mode and the native-arm ``rag`` tool: chroma cosine
+        over ``self._rag`` (all ``retrieve_k`` hits), then Cohere rerank when enabled. This keeps
+        the compact / native paths byte-identical to the pre-switch behavior; the pluggable
+        ``retrieval_engine`` governs faithful Stage-2 retrieval (see ``_retrieve_subqueries``)."""
         hits = self._rag.query(query)
         if self.rerank:
             hits = rerank_passages(query, hits, top_n=self.rerank_top_n)
         return hits
+
+    def _retrieve_subqueries(self, subqueries: list[str]) -> list[dict]:
+        """Retrieve per subquery via the configured engine, fanned out across the thread pool,
+        then union/dedup across subqueries in subquery order.
+
+        Result-preserving: the per-subquery hit lists are reassembled in subquery order (see
+        ``_map_parallel``) and the dedup'd union is built in that same order, so the passage
+        list — and the downstream ``[n]`` citation indices — are identical to the serial loop.
+        The dedup/union policy is identical across engines; only ``self._engine.retrieve``
+        differs."""
+        def _fetch(sq: str) -> list[dict]:
+            try:
+                return self._engine.retrieve(sq, retrieve_k=self.retrieve_k,
+                                             top_n=self.rerank_top_n, usage=self._usage)
+            except Exception:  # noqa: BLE001 — one bad subquery never sinks the case
+                return []
+
+        per_subquery = self._map_parallel(_fetch, subqueries, self.rag_workers)
+        seen: set = set()
+        union: list[dict] = []
+        for hits in per_subquery:  # per_subquery preserves subquery order
+            for h in hits:
+                key = (h.get("source", ""), h.get("title", ""), (h.get("text", "") or "")[:200])
+                if key in seen:
+                    continue
+                seen.add(key)
+                union.append(h)
+        return union
 
     # --- tool dispatch -------------------------------------------------------
     def _dispatch(self, name: str, args: dict, retrieved_acc: list) -> str:
@@ -213,6 +340,12 @@ class FerberAgent:
         if name == "histology_classifier":
             return histology_classifier_unavailable(args.get("marker", ""),
                                                     args.get("image_ref", ""))
+        if name == "web_search":
+            text, n_urls = web_search(args.get("query", ""), model=self.llm_model)
+            self._usage.add_web_search_call(1)
+            if n_urls:
+                self._usage.bump("web_search_cited")
+            return text
         return f"unknown tool {name}"
 
     # === faithful mode: the paper's described pipeline =====================
@@ -294,18 +427,48 @@ class FerberAgent:
         if name == "histology_classifier":
             return histology_replay(self._case_key or args.get("patient_id", ""),
                                     args.get("targets"))
+        if name == "web_search":
+            text, n_urls = web_search(args.get("query", ""), model=self.llm_model)
+            self._usage.add_web_search_call(1)
+            if n_urls:
+                self._usage.bump("web_search_cited")
+            return text
         return f"unknown tool {name}"
+
+    # --- backbone calls with usage / latency accounting ----------------------
+    def _chat(self, messages: list[dict], tools=None, max_tokens: int = 6000,
+              temperature: float = 0.1, stage: str = ""):
+        """chat.completions call wrapped with usage + latency accounting. Routes through the
+        module-level _create so test/capture wrappers that patch it still apply."""
+        with self._usage.timer():
+            resp = _create(self.llm_model, messages, tools=tools,
+                           max_tokens=max_tokens, temperature=temperature)
+        self._usage.add_chat(resp, stage=stage)
+        return resp
+
+    def _resp_call(self, *, instructions: str | None = None, input, tools=None,
+                   max_tokens: int = 6000, stage: str = ""):
+        """Responses-API call wrapped with usage + latency accounting."""
+        with self._usage.timer():
+            resp = _responses_create(self.llm_model, instructions=instructions, input=input,
+                                     tools=tools, max_tokens=max_tokens)
+        self._usage.add_responses(resp, stage=stage)
+        return resp
 
     def _stage(self, doc: str, field_name: str, field_desc: str, user: str,
                max_tokens: int = 2000) -> str:
-        """Run one dspy-style signature stage as a single chat call: the verbatim docstring is
-        the instruction, the verbatim OutputField desc specifies the output, the user message
-        carries the (labelled) input fields. Returns the model's text."""
+        """Run one dspy-style signature stage as a single call: the verbatim docstring is the
+        instruction, the verbatim OutputField desc specifies the output, the user message
+        carries the (labelled) input fields. Identical verbatim prompts across the chat and
+        Responses backends — only the transport differs. Returns the model's text."""
         system = f"{doc}\n\nProduce the field `{field_name}`: {field_desc}"
-        resp = _create(self.llm_model,
-                       [{"role": "system", "content": system},
-                        {"role": "user", "content": user}],
-                       max_tokens=max_tokens, temperature=self.rag_temp)
+        if self.backend == BACKEND_RESPONSES:
+            resp = self._resp_call(instructions=system, input=user,
+                                   max_tokens=max_tokens, stage=field_name)
+            return resp.output_text or ""
+        resp = self._chat([{"role": "system", "content": system},
+                           {"role": "user", "content": user}],
+                          max_tokens=max_tokens, temperature=self.rag_temp, stage=field_name)
         return resp.choices[0].message.content or ""
 
     def _citation_selfeval(self, cited: str, retrieved: list[dict], cited_user: str,
@@ -364,50 +527,14 @@ class FerberAgent:
                 return revised, record
         return cited, record
 
-    def _answer_faithful(self, context: str, question: str) -> FerberResult:
-        active = self._faithful_tools()
-        schemas = faithful_tool_schemas(active)
-        # --- Stage 1: autonomous tool gathering (verbatim agent + chat_ext prompts) ----
-        instruction = _fp.CHAT_EXT_INSTRUCTION.replace("{question}", question)
-        messages: list[dict] = [
-            {"role": "system", "content": _fp.AGENT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"{context}\n{instruction}"},
-        ]
-        tool_calls: list[dict] = []
-        retrieved: list[dict] = []
-        nudged = False
-        last_content = ""
-        for _ in range(self.max_function_calls):
-            resp = _create(self.llm_model, messages, tools=schemas,
-                           max_tokens=self.synth_max_tokens, temperature=self.agent_temp)
-            msg = resp.choices[0].message
-            tcs = msg.tool_calls or []
-            last_content = msg.content or last_content
-            assistant_msg = {"role": "assistant", "content": msg.content or ""}
-            if tcs:
-                assistant_msg["tool_calls"] = [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in tcs]
-            messages.append(assistant_msg)
-            if not tcs:
-                # mirror the original _should_continue: nudge once to use ALL tools, then stop.
-                if not nudged:
-                    nudged = True
-                    messages.append({"role": "user", "content": _fp.MUST_USE_ALL_TOOLS_NUDGE})
-                    continue
-                break
-            for tc in tcs:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                result = self._dispatch_faithful(tc.function.name, args, retrieved)
-                tool_calls.append({"tool": tc.function.name, "args": args, "result": result[:1500]})
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result[:6000]})
-        tool_results = last_content or "No tools were used."
+    def _faithful_stage2(self, context: str, question: str, tool_results: str,
+                         tool_calls: list[dict], schemas: list[dict]) -> FerberResult:
+        """Stage 2 of the faithful pipeline, shared by the chat and Responses backends.
 
-        # --- Stage 2: mandatory guideline RAG (Search -> retrieve -> strategy -> cited -> sugg) --
+        Search subquery fan-out -> per-subquery retrieval via the configured engine (parallel,
+        result-preserving) -> AnswerStrategy -> RequireInput -> GenerateCitedResponse -> optional
+        citation self-eval -> Suggestions. ``_stage`` is backend-routed, so the only difference
+        between the two backends is Stage 1 (the caller); Stage 2 here is identical."""
         # 2a. Search: expand into focused subqueries (verbatim Search signature).
         sub_user = (f"question: {question}\ncontext: {context[:3000]}\n"
                     f"tool_results: {tool_results[:3000]}")
@@ -420,33 +547,8 @@ class FerberAgent:
                 subqueries.append(q)
         subqueries = subqueries[: self.n_subqueries]
 
-        # 2b. retrieve top-K per subquery -> rerank top-N -> union/dedup.
-        # The 12 subquery retrievals are independent, so they fan out across a thread pool.
-        # Each subquery's retrieve+rerank is unchanged; the per-subquery hit
-        # lists are returned in subquery order and the dedup'd union is built in that SAME
-        # order, so the resulting passage list is byte-identical to the serial loop —
-        # the [n] citation indices downstream are unaffected. Embedding is cached and runs
-        # outside the Chroma lock, so the slow OpenAI embed step is what actually parallelizes.
-        def _fetch(sq: str) -> list[dict]:
-            try:
-                # cached chroma-retrieve + rerank: deterministic per (query,k,top_n),
-                # so the parallel fan-out is provably exact and the agent is reproducible.
-                return self._rag.retrieve_reranked(sq, self.retrieve_k, self.rerank_top_n,
-                                                   self.rerank)
-            except Exception:  # noqa: BLE001 — drop this subquery (parity with serial `continue`)
-                return []
-
-        per_subquery = self._map_parallel(_fetch, subqueries, self.rag_workers)
-        seen: set = set()
-        union: list[dict] = []
-        for hits in per_subquery:  # per_subquery preserves subquery order
-            for h in hits:
-                key = (h.get("source", ""), h.get("title", ""), (h.get("text", "") or "")[:200])
-                if key in seen:
-                    continue
-                seen.add(key)
-                union.append(h)
-        retrieved = union
+        # 2b. retrieve top-K per subquery via the configured engine -> union/dedup (parallel).
+        retrieved = self._retrieve_subqueries(subqueries)
         # passages prefixed "Source {idx}:" so the [x] citation instruction resolves.
         passages = "\n\n".join(
             f"Source {i}: [{h.get('source','')}: {h.get('title','')}] {(h.get('text','') or '')[:700]}"
@@ -497,14 +599,234 @@ class FerberAgent:
         # (rag has no Table-1 counterpart, so it does not affect tool-use fidelity).
         tool_calls.append({
             "tool": "rag",
-            "args": {"mode": "mandatory_stage2_grounding", "n_subqueries": len(subqueries),
-                     "subqueries": subqueries, "citation_selfeval": selfeval_rec},
+            "args": {"mode": "mandatory_stage2_grounding", "engine": self.retrieval_engine,
+                     "n_subqueries": len(subqueries), "subqueries": subqueries,
+                     "citation_selfeval": selfeval_rec},
             "result": f"retrieved {len(retrieved)} passages from "
                       f"{sorted({h.get('source','') for h in retrieved})}"[:1500],
+            "retrieval": {
+                "engine": self.retrieval_engine,
+                "n_passages": len(retrieved),
+                "passages": [{"source": h.get("source", ""), "title": h.get("title", ""),
+                              "score": h.get("score"), "chunk_chars": h.get("chunk_chars"),
+                              "text_head": (h.get("text", "") or "")[:200]}
+                             for h in retrieved],
+            },
         })
         citations = [{"source": h.get("source", ""), "title": h.get("title", "")}
                      for h in retrieved[:10]]
         return FerberResult(answer_text=answer_text, citations=citations,
+                            tool_calls=tool_calls, retrieved=retrieved)
+
+    def _answer_faithful(self, context: str, question: str) -> FerberResult:
+        """chat_completions backend: faithful Stage 1 (function-calling tool loop) + Stage 2."""
+        active = self._faithful_tools()
+        schemas = faithful_tool_schemas(active)
+        # --- Stage 1: autonomous tool gathering (verbatim agent + chat_ext prompts) ----
+        instruction = _fp.CHAT_EXT_INSTRUCTION.replace("{question}", question)
+        messages: list[dict] = [
+            {"role": "system", "content": _fp.AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{context}\n{instruction}"},
+        ]
+        tool_calls: list[dict] = []
+        retrieved: list[dict] = []
+        nudged = False
+        last_content = ""
+        for _ in range(self.max_function_calls):
+            resp = self._chat(messages, tools=schemas, max_tokens=self.synth_max_tokens,
+                              temperature=self.agent_temp, stage="agent_loop")
+            msg = resp.choices[0].message
+            tcs = msg.tool_calls or []
+            last_content = msg.content or last_content
+            assistant_msg = {"role": "assistant", "content": msg.content or ""}
+            if tcs:
+                assistant_msg["tool_calls"] = [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in tcs]
+            messages.append(assistant_msg)
+            if not tcs:
+                # mirror the original _should_continue: nudge once to use ALL tools, then stop.
+                if not nudged:
+                    nudged = True
+                    messages.append({"role": "user", "content": _fp.MUST_USE_ALL_TOOLS_NUDGE})
+                    continue
+                break
+            for tc in tcs:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = self._dispatch_faithful(tc.function.name, args, retrieved)
+                self._usage.bump("n_tool_exec")
+                tool_calls.append({"tool": tc.function.name, "args": args, "result": result[:1500]})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result[:6000]})
+        tool_results = last_content or "No tools were used."
+        return self._faithful_stage2(context, question, tool_results, tool_calls, schemas)
+
+    # === responses_faithful backend: the SAME explicit faithful pipeline, via the Responses API
+    def _responses_stage1(self, context: str, question: str):
+        """Stage 1 (autonomous tool gathering) on the Responses API.
+
+        Identical verbatim prompts and the same faithful evidence tools as the chat backend's
+        Stage 1, but (1) executed via Responses, (2) reasoning items are carried across tool
+        calls by passing the full prior output back as the next input, and (3) the native hosted
+        ``web_search`` tool is attached alongside the function tools instead of the chat
+        backend's nested-call web_search function. Returns (tool_results, tool_calls)."""
+        active = self._faithful_tools()  # oncokb/pubmed/calculate (+imaging when present)
+        func_tools = _responses_function_tools(faithful_tool_schemas(active))
+        tools = list(func_tools)
+        if self.web_search:
+            tools.append({"type": "web_search"})  # native hosted web search
+
+        instruction = _fp.CHAT_EXT_INSTRUCTION.replace("{question}", question)
+        # verbatim system + user content, byte-identical to the chat backend (only transport differs)
+        conv: list = [
+            {"role": "system", "content": _fp.AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{context}\n{instruction}"},
+        ]
+        tool_calls: list[dict] = []
+        retrieved: list[dict] = []
+        nudged = False
+        last_text = ""
+        for _ in range(self.max_function_calls):
+            resp = self._resp_call(input=conv, tools=tools,
+                                   max_tokens=self.synth_max_tokens, stage="agent_loop")
+            out_items = list(getattr(resp, "output", []) or [])
+            conv += out_items  # carry reasoning + tool-call items forward (reasoning preserved)
+            if resp.output_text:
+                last_text = resp.output_text
+            if _collect_url_citations(resp):
+                self._usage.bump("web_search_cited")
+            fcs = [it for it in out_items if getattr(it, "type", None) == "function_call"]
+            if not fcs:
+                if not nudged:  # mirror the chat backend: nudge once to use all tools, then stop
+                    nudged = True
+                    conv.append({"role": "user", "content": _fp.MUST_USE_ALL_TOOLS_NUDGE})
+                    continue
+                break
+            for fc in fcs:
+                try:
+                    args = json.loads(fc.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = self._dispatch_faithful(fc.name, args, retrieved)
+                self._usage.bump("n_tool_exec")
+                tool_calls.append({"tool": fc.name, "args": args, "result": result[:1500]})
+                conv.append({"type": "function_call_output", "call_id": fc.call_id,
+                             "output": result[:6000]})
+        return (last_text or "No tools were used."), tool_calls
+
+    def _answer_faithful_responses(self, context: str, question: str) -> FerberResult:
+        """responses_faithful backend: Responses Stage 1 (reasoning-preserving, hosted web
+        search) + the SAME Stage 2 as the chat backend (``_stage`` routes to Responses)."""
+        active = self._faithful_tools()
+        schemas = faithful_tool_schemas(active)
+        tool_results, tool_calls = self._responses_stage1(context, question)
+        return self._faithful_stage2(context, question, tool_results, tool_calls, schemas)
+
+    # === native_agentic backend: OpenAI's Responses runtime drives the loop ================
+    _NATIVE_SYSTEM = (
+        "You are an expert molecular tumor board assistant. Given a patient's clinical and "
+        "genomic context and a question, decide which tools to call and in what order, gather "
+        "the evidence you need, and then write a thorough, clinically grounded free-text "
+        "treatment recommendation. Cite the sources you rely on. Use the available tools "
+        "whenever they would improve the answer; reason carefully before concluding. "
+        "All available case information and images have already been provided to you. Do NOT "
+        "ask for additional files and do NOT emit any [REQUEST: ...] or [FILE: ...] tags; "
+        "answer directly with what you have."
+    )
+
+    @staticmethod
+    def _strip_file_tags(text: str) -> str:
+        """Remove stray [REQUEST: ...] / [FILE: ...] protocol tags the model may echo into its
+        free-text answer (it sees the dataset's "you can ask for files" instruction in context).
+        Such tags, when returned, are misread by a dataset loop as a file request and trigger an
+        attach -> re-request loop. Only whole tags are removed; clinical prose is untouched."""
+        import re as _re
+        if not text:
+            return text
+        return _re.sub(r"\[(?:REQUEST|FILE):[^\]]*\]", "", text).strip()
+
+    def _native_tools(self) -> list[dict]:
+        """Tool set for the native-agentic backend. With domain tools (``self.tool_names``
+        non-empty): the faithful evidence tools + a callable guideline ``rag`` tool + native
+        web_search. With no domain tools: native web_search only (a vanilla web agent)."""
+        tools: list[dict] = []
+        if self.tool_names:  # full Ferber domain harness, native-orchestrated
+            active = ["oncokb", "pubmed", "calculate"]
+            if self._images:
+                active += ["radiology_report", "medsam", "histology_classifier"]
+            tools += _responses_function_tools(faithful_tool_schemas(active))
+            if self._rag is not None:
+                tools += _responses_function_tools(tool_schemas(["rag"]))
+        if self.web_search:
+            tools.append({"type": "web_search"})  # native hosted web search
+        return tools
+
+    def _answer_native_agentic(self, context: str, question: str) -> FerberResult:
+        tools = self._native_tools()
+        conv: list = [
+            {"role": "system", "content": self._NATIVE_SYSTEM},
+            {"role": "user", "content": f"Patient context:\n{context}\n\nQuestion:\n{question}"},
+        ]
+        tool_calls: list[dict] = []
+        retrieved: list[dict] = []
+        last_text = ""
+        for _ in range(self.max_function_calls):
+            resp = self._resp_call(input=conv, tools=tools,
+                                   max_tokens=self.synth_max_tokens, stage="native_loop")
+            out_items = list(getattr(resp, "output", []) or [])
+            conv += out_items  # reasoning + tool calls carried forward
+            if resp.output_text:
+                last_text = resp.output_text
+            if _collect_url_citations(resp):
+                self._usage.bump("web_search_cited")
+            fcs = [it for it in out_items if getattr(it, "type", None) == "function_call"]
+            if not fcs:
+                break
+            for fc in fcs:
+                try:
+                    args = json.loads(fc.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                if fc.name == "rag" and self._rag is not None:
+                    hits = self._retrieve(args.get("query", ""))
+                    retrieved.extend(hits)
+                    result = "\n\n".join(
+                        f"[{h['source']}: {h['title']}] {h['text'][:500]}" for h in hits[:8]
+                    ) or "no hits"
+                else:
+                    result = self._dispatch_faithful(fc.name, args, retrieved)
+                self._usage.bump("n_tool_exec")
+                tool_calls.append({"tool": fc.name, "args": args, "result": result[:1500]})
+                conv.append({"type": "function_call_output", "call_id": fc.call_id,
+                             "output": result[:6000]})
+        # Strip any stray file-protocol tags the model echoed into its answer (otherwise a
+        # dataset loop misreads them as a file request and overwrites the answer with a
+        # "[FILE: x] not found" line).
+        last_text = self._strip_file_tags(last_text)
+        # Robustness: the native runtime occasionally ends a turn with only a brief message
+        # right after a hosted web_search (a terse "I can't fully conclude..." rather than the
+        # full recommendation), or with nothing left after tag-stripping. When the model clearly
+        # did work (searched / called tools) but the final text is degenerate, give it one
+        # explicit turn to write the full answer. This does not change which tools it used or how
+        # it orchestrated, only that it finishes its answer.
+        if len((last_text or "").strip()) < 300 and (self._usage.web_search_calls
+                                                     or self._usage.n_tool_exec):
+            conv.append({"role": "user", "content": (
+                "Now write your full, detailed free-text treatment recommendation for this "
+                "patient based on the evidence you gathered above. Cite the sources you used. "
+                "Do not ask for more files or emit any [REQUEST: ...] or [FILE: ...] tags.")})
+            resp = self._resp_call(input=conv, tools=tools,
+                                   max_tokens=self.synth_max_tokens, stage="native_finalize")
+            if resp.output_text:
+                last_text = self._strip_file_tags(resp.output_text)
+            if _collect_url_citations(resp):
+                self._usage.bump("web_search_cited")
+        citations = [{"source": h.get("source", ""), "title": h.get("title", "")}
+                     for h in retrieved[:10]]
+        return FerberResult(answer_text=last_text or "", citations=citations,
                             tool_calls=tool_calls, retrieved=retrieved)
 
     def answer(self, context: str, question: str,
@@ -513,7 +835,13 @@ class FerberAgent:
         self._images = dict(images or {})
         if case_key is not None:
             self._case_key = case_key
+        self._usage.reset()  # per-rollout usage / cost / latency
+        # backend routing.
+        if self.backend == BACKEND_NATIVE:
+            return self._answer_native_agentic(context, question)
         if self.faithful:
+            if self.backend == BACKEND_RESPONSES:
+                return self._answer_faithful_responses(context, question)
             return self._answer_faithful(context, question)
         active = self._active_tools()
         schemas = tool_schemas(active)
@@ -562,6 +890,7 @@ class FerberAgent:
         final = _create(self.llm_model, synth_messages)
         answer_text = final.choices[0].message.content or ""
 
-        citations = [{"source": h["source"], "title": h["title"]} for h in retrieved[:10]]
+        citations = [{"source": h.get("source", ""), "title": h.get("title", "")}
+                     for h in retrieved[:10]]
         return FerberResult(answer_text=answer_text, citations=citations,
                             tool_calls=tool_calls, retrieved=retrieved)

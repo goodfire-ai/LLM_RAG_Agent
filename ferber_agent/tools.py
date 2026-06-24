@@ -280,6 +280,68 @@ def rerank_passages(query: str, hits: list[dict], top_n: int = 10,
         return hits[:top_n]
 
 
+# --- web search (replaces the discontinued google_search) --------------------
+# The paper's agent had a google_search tool (a nested llama-hub GoogleSearchToolSpec agent
+# keyed on GOOGLE_API_KEY / GOOGLE_SEARCH_ENGINE). The Google Custom Search whole-web endpoint
+# was discontinued, so the capability is restored via OpenAI's native web search. This function
+# tool makes a nested Responses-API ``web_search`` call and returns the synthesized answer plus
+# the cited source URLs — the modern equivalent of the original's nested google_search agent.
+# It is used as a callable function tool on the chat.completions backend; the Responses-based
+# backends instead expose the hosted ``web_search`` tool directly on the model loop.
+def web_search(query: str, model: str = "gpt-5.1") -> tuple[str, int]:
+    """Run a nested OpenAI web search and return ``(cited_summary, n_url_citations)``.
+
+    The summary is a compact, source-cited string the agent can fold into its evidence; the
+    integer is the number of distinct URL citations (0 means the search returned nothing
+    usable). Best-effort: any failure degrades to an explicit message and never raises, so a
+    transient search outage cannot sink a case.
+    """
+    if not (query or "").strip():
+        return "web_search: empty query", 0
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=4, timeout=120.0)
+        instr = (
+            "You are a clinical web-search assistant for a molecular tumor board. Search the "
+            "web for the query and return a concise, factual summary of the most relevant, "
+            "authoritative findings (FDA labels, NCCN/ESMO/ASCO guidance, pivotal trials). "
+            "Cite each claim with its source."
+        )
+        resp = client.responses.create(
+            model=model,
+            tools=[{"type": "web_search"}],
+            tool_choice="auto",
+            input=[{"role": "system", "content": instr},
+                   {"role": "user", "content": query}],
+        )
+        text = (resp.output_text or "").strip()
+        urls = _collect_url_citations(resp)
+        if urls:
+            text += "\n\nSources:\n" + "\n".join(f"- {u}" for u in urls)
+        return (text or "web_search: no results"), len(urls)
+    except Exception as e:  # noqa: BLE001 — web search is best-effort; degrade to a message
+        return f"web_search failed: {e}", 0
+
+
+def _collect_url_citations(resp) -> list[str]:
+    """Extract the distinct ``url_citation`` URLs from a Responses message output.
+
+    Used both by :func:`web_search` (chat backend) and by the Responses backends to tell
+    whether a hosted web-search result was actually cited in the model's answer."""
+    urls: list[str] = []
+    for item in getattr(resp, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", []) or []:
+            for ann in getattr(part, "annotations", []) or []:
+                if getattr(ann, "type", None) == "url_citation":
+                    u = getattr(ann, "url", None)
+                    if u and u not in urls:
+                        urls.append(u)
+    return urls[:10]
+
+
 # --- OncoKB ------------------------------------------------------------------
 def oncokb_annotate(hugo_symbol: str, alteration: str) -> str:
     token = os.environ.get("ONCOKB_API_TOKEN")
@@ -735,6 +797,17 @@ def faithful_tool_schemas(enabled: tuple[str, ...]) -> list[dict]:
                 "patient_id": {"type": "string"},
                 "targets": {"type": "array", "items": {"type": "string"}}},
                 "required": ["patient_id"]}}},
+        # web_search replaces the paper's discontinued google_search. It is additive and not
+        # part of the verbatim-faithful byte-diff set, so its description is a modern
+        # web-search equivalent of the original google_search tool rather than a vendored block.
+        "web_search": {"type": "function", "function": {
+            "name": "web_search", "description": (
+                "Search the web for current authoritative oncology information (FDA approvals, "
+                "NCCN/ESMO/ASCO guidance, pivotal trials, drug labels) when the knowledge base "
+                "and other tools are insufficient. Returns a source-cited summary."),
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string", "description": "the web search query"}},
+                "required": ["query"]}}},
     }
     return [schemas[t] for t in enabled if t in schemas]
 
@@ -825,6 +898,17 @@ def tool_schemas(enabled: tuple[str, ...]) -> list[dict]:
                     "marker": {"type": "string",
                                "description": "one of KRAS, BRAF, MSI"}},
                     "required": ["marker"]},
+            }},
+        "web_search": {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current authoritative oncology information "
+                               "(FDA approvals, NCCN/ESMO/ASCO guidance, pivotal trials, drug "
+                               "labels). Returns a source-cited summary.",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string", "description": "the web search query"}},
+                    "required": ["query"]},
             }},
     }
     return [schemas[t] for t in enabled if t in schemas]

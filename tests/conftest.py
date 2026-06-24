@@ -5,7 +5,8 @@ so the full faithful pipeline runs offline (no OpenAI / Chroma / Cohere / GPU):
 
   * ``ferber_agent.agent._create`` — the Stage-1 tool-gathering chat call (module function).
   * ``agent._stage``               — every Stage-2 dspy-style chat call (instance method).
-  * ``agent._rag``                 — the retriever (``retrieve_reranked`` / ``query``).
+  * ``agent._rag``                 — the retriever (``retrieve_reranked`` / ``query``); the
+                                     default ``chroma_cosine`` engine is rebuilt to wrap it.
 
 Because the stubs are deterministic, the only thing that varies between a serial run
 (``workers=1``) and a parallel run (``workers=12``) is the thread-pool fan-out — which is
@@ -118,6 +119,7 @@ def make_offline_agent(monkeypatch):
             citation_selfeval=citation_selfeval,
         )
         agent._rag = FakeRag()
+        agent._build_engine()  # rebuild the chroma_cosine engine so it wraps the FakeRag
         agent._stage = make_stage_stub()  # type: ignore[assignment]
         agent.rag_workers = workers
         agent.citation_workers = workers
