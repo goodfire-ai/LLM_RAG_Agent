@@ -13,32 +13,130 @@ the multimodal ferber20 track:
   - histology_classifier  in-house KRAS/BRAF/MSI histology classifier — UNAVAILABLE
                           (unreleased upstream; returns an explicit gap message)
 
+Faithful mode uses verbatim-faithful variants whose descriptions and parameter shapes match
+the original dspy source (``*_faithful`` functions + ``faithful_tool_schemas``), and replays
+the paper's pre-extracted per-case histology predictions (``histology_replay``) instead of the
+unavailable in-house classifier. The retrieval embedding/rerank cache (``cached_embed`` /
+``RagTool.retrieve_reranked``) is a result-preserving speedup that also makes retrieval
+reproducible run-to-run.
+
 Cohere reranking (``rerank_passages``) restores the paper's rerank step when COHERE_API_KEY
-is set; otherwise retrieval is cosine-only (a recorded deviation).
+is set; otherwise retrieval is cosine-only.
 """
 from __future__ import annotations
 
 import base64
+import functools
+import hashlib
 import json
 import mimetypes
 import os
 import threading
 import urllib.parse
+from pathlib import Path
 
 import requests
 
+from . import faithful_prompts as _fp
+
 _TIMEOUT = 20
+
+# --- retrieval embedding cache (result-preserving speedup) -------------------
+# text-embedding-3-large is deterministic for a given input, so caching an
+# embedding can never change a retrieval result — it only avoids a repeated
+# OpenAI round-trip. Two layers: a process-global in-memory dict (shared across
+# the per-case worker threads, which each build their own RagTool) and a disk
+# cache under EMBED_CACHE_DIR (shared across processes/runs).
+_EMBED_MEM: dict[str, list] = {}
+_RETR_MEM: dict[str, list] = {}
+_EMBED_MEM_LOCK = threading.Lock()
+_RETR_MEM_LOCK = threading.Lock()
+_CACHE_STATS = {"mem_hit": 0, "disk_hit": 0, "miss": 0,
+                "retr_mem_hit": 0, "retr_disk_hit": 0, "retr_miss": 0}
+_STATS_LOCK = threading.Lock()
+
+
+def _stat(key: str) -> None:
+    with _STATS_LOCK:
+        _CACHE_STATS[key] += 1
+
+
+def cache_stats() -> dict:
+    """Snapshot of embedding + retrieval cache hit/miss counters for this process."""
+    with _STATS_LOCK:
+        s = dict(_CACHE_STATS)
+    et = s["mem_hit"] + s["disk_hit"] + s["miss"]
+    rt = s["retr_mem_hit"] + s["retr_disk_hit"] + s["retr_miss"]
+    s["total"] = et
+    s["hit_rate"] = (s["mem_hit"] + s["disk_hit"]) / et if et else 0.0
+    s["retr_total"] = rt
+    s["retr_hit_rate"] = (s["retr_mem_hit"] + s["retr_disk_hit"]) / rt if rt else 0.0
+    return s
+
+
+def _embed_disk_path(cache_dir: str, embed_model: str, text: str) -> str:
+    h = hashlib.sha256(f"{embed_model}\x00{text}".encode("utf-8")).hexdigest()
+    return os.path.join(cache_dir, h[:2], h + ".json")
+
+
+def _atomic_write_json(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{hashlib.md5(os.urandom(8)).hexdigest()[:8]}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def cached_embed(ef, embed_model: str, text: str, cache_dir: str | None) -> list:
+    """Embed one query, reusing the in-memory then disk cache. Falls back to a
+    live ``ef([text])`` call on a miss. Pure cache: the returned vector is the
+    same one ``ef`` would have produced (deterministic embedding model)."""
+    mem_key = f"{embed_model}\x00{text}"
+    with _EMBED_MEM_LOCK:
+        v = _EMBED_MEM.get(mem_key)
+    if v is not None:
+        _stat("mem_hit")
+        return v
+    disk_path = _embed_disk_path(cache_dir, embed_model, text) if cache_dir else None
+    if disk_path and os.path.exists(disk_path):
+        try:
+            with open(disk_path) as f:
+                v = json.load(f)
+            with _EMBED_MEM_LOCK:
+                _EMBED_MEM[mem_key] = v
+            _stat("disk_hit")
+            return v
+        except Exception:  # noqa: BLE001 — a corrupt/partial cache file just re-embeds
+            pass
+    # miss: embed live via the collection's own embedding function (identical to
+    # what coll.query(query_texts=...) computes internally).
+    raw = ef([text])[0]
+    v = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+    with _EMBED_MEM_LOCK:
+        _EMBED_MEM[mem_key] = v
+    if disk_path:
+        try:
+            _atomic_write_json(disk_path, v)
+        except Exception:  # noqa: BLE001 — caching is best-effort
+            pass
+    _stat("miss")
+    return v
 
 
 # --- RAG retrieval -----------------------------------------------------------
 class RagTool:
-    def __init__(self, chroma_dir: str, collection: str, embed_model: str, k: int = 20):
+    def __init__(self, chroma_dir: str, collection: str, embed_model: str, k: int = 20,
+                 embed_cache_dir: str | None = None):
         self.chroma_dir = chroma_dir
         self.collection_name = collection
         self.embed_model = embed_model
         self.k = k
         self._coll = None
+        self._ef = None
         self._lock = threading.Lock()
+        # disk embedding cache (cross-process / cross-run). EMBED_CACHE_DIR env
+        # var overrides; None disables disk caching (in-memory only).
+        self.embed_cache_dir = embed_cache_dir or os.environ.get("EMBED_CACHE_DIR") or None
 
     def _collection(self):
         if self._coll is None:
@@ -52,9 +150,40 @@ class RagTool:
                     client = chromadb.PersistentClient(path=self.chroma_dir)
                     self._coll = client.get_collection(
                         name=self.collection_name, embedding_function=ef)
+                    self._ef = ef
         return self._coll
 
     def query(self, query: str, k: int | None = None) -> list[dict]:
+        """Retrieve top-k passages for ``query``.
+
+        Result-preserving speedup: the embedding (the OpenAI round-trip, the slow
+        part) is computed with the collection's OWN embedding function *outside* the
+        lock and cached, so concurrent subquery retrievals no longer serialize on the
+        embed step. The cheap in-memory Chroma vector search stays under the lock.
+        Using ``query_embeddings`` with the collection's EF returns the identical hit
+        set that ``query_texts`` would (verified by the equivalence test), since
+        ``query_texts`` just runs that same EF internally."""
+        k = k or self.k
+        coll = self._collection()
+        emb = cached_embed(self._ef, self.embed_model, query, self.embed_cache_dir)
+        with self._lock:
+            res = coll.query(query_embeddings=[emb], n_results=k)
+        docs = res["documents"][0]
+        metas = res["metadatas"][0]
+        dists = res.get("distances", [[None] * len(docs)])[0]
+        out = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            out.append({
+                "text": doc,
+                "title": (meta or {}).get("title", ""),
+                "source": (meta or {}).get("source", ""),
+                "distance": float(dist) if dist is not None else None,
+            })
+        return out
+
+    def query_texts(self, query: str, k: int | None = None) -> list[dict]:
+        """Original ``query_texts`` retrieval path, kept as the reference for the
+        equivalence check (to confirm the embed-path change is result-preserving)."""
         k = k or self.k
         coll = self._collection()
         with self._lock:
@@ -71,6 +200,53 @@ class RagTool:
                 "distance": float(dist) if dist is not None else None,
             })
         return out
+
+    def retrieve_reranked(self, query: str, k: int, top_n: int, rerank: bool) -> list[dict]:
+        """Full per-subquery retrieval: chroma top-k -> Cohere rerank top-n (or cosine
+        truncation). Cached by (collection, embed_model, query, k, top_n, rerank).
+
+        Why cache the RERANK output and not just the embedding: chroma retrieval is
+        deterministic, but Cohere rerank scores on near-tied guideline chunks vary
+        run-to-run, so the reranked top-n flips between calls. Calling Cohere live
+        every run makes retrieval non-reproducible. Caching the reranked result fixes
+        ONE draw and reuses it, making the agent reproducible (and the parallel fan-out
+        provably exact), without biasing the result — the same sense in which the
+        embedding cache is pure."""
+        mem_key = f"{self.collection_name}\x00{self.embed_model}\x00{query}\x00{k}\x00{top_n}\x00{int(rerank)}"
+        with _RETR_MEM_LOCK:
+            cached = _RETR_MEM.get(mem_key)
+        if cached is not None:
+            _stat("retr_mem_hit")
+            return [dict(h) for h in cached]
+        disk_path = None
+        if self.embed_cache_dir:
+            h = hashlib.sha256(("retr\x00" + mem_key).encode("utf-8")).hexdigest()
+            disk_path = os.path.join(self.embed_cache_dir, "retr", h[:2], h + ".json")
+            if os.path.exists(disk_path):
+                try:
+                    with open(disk_path) as f:
+                        cached = json.load(f)
+                    with _RETR_MEM_LOCK:
+                        _RETR_MEM[mem_key] = cached
+                    _stat("retr_disk_hit")
+                    return [dict(h) for h in cached]
+                except Exception:  # noqa: BLE001
+                    pass
+        # miss: compute live (chroma deterministic; rerank one fixed draw)
+        hits = self.query(query, k=k)
+        if rerank:
+            hits = rerank_passages(query, hits, top_n=top_n)
+        else:
+            hits = hits[:top_n]
+        with _RETR_MEM_LOCK:
+            _RETR_MEM[mem_key] = hits
+        if disk_path:
+            try:
+                _atomic_write_json(disk_path, hits)
+            except Exception:  # noqa: BLE001
+                pass
+        _stat("retr_miss")
+        return [dict(h) for h in hits]
 
 
 # --- Cohere reranking --------------------------------------------------------
@@ -334,6 +510,233 @@ def histology_classifier_unavailable(marker: str = "", image_ref: str = "") -> s
             "KRAS/BRAF/MSI H&E classifiers were never publicly released and cannot be "
             "reproduced. Use the molecular/genomic report for mutation and MSI status, and "
             "OncoKB for the therapeutic implications.")
+
+
+# =============================================================================
+# Faithful mode: the paper's described pipeline.
+#
+# The internal tool NAMES are kept modern (oncokb/pubmed/calculate/radiology_report/medsam/
+# histology_classifier) so a downstream tool-use mapping keyed on those names is unchanged.
+# What is restored to be VERBATIM-faithful is the tool *descriptions* (copied character-for-
+# character from the original agent_tools.py docstrings, via faithful_prompts) and the
+# *parameter shapes* (the original signatures: oncokb's change=mutation/amplification/variant,
+# pubmed's search-terms list, calculate's a/b/operator, radiology's folder-of-images, segment's
+# nested bbox list). The histology tool replays the paper's pre-extracted per-case MSI/KRAS/BRAF
+# predictions (see histology_replay).
+# =============================================================================
+
+
+# --- faithful OncoKB: restore the change=mutation/amplification/variant branch ----
+def oncokb_annotate_faithful(hugo_symbol: str, change: str, alteration: str) -> str:
+    """Port of the original onco_kb(hugo_symbol, change, alteration): three OncoKB endpoints
+    selected by ``change`` (mutation / amplification / variant). Uses the prod endpoint when an
+    ONCOKB_API_TOKEN is set, else the public demo endpoint (a recorded deviation)."""
+    token = os.environ.get("ONCOKB_API_TOKEN")
+    base = "https://www.oncokb.org/api/v1" if token else "https://demo.oncokb.org/api/v1"
+    headers = {"accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    change = (change or "mutation").strip().lower()
+    try:
+        if change == "amplification":
+            url = f"{base}/annotate/copyNumberAlterations"
+            params = {"hugoSymbol": hugo_symbol, "copyNameAlterationType": alteration.upper()}
+        elif change == "variant":
+            a, _, b = hugo_symbol.partition("-")
+            url = f"{base}/annotate/structuralVariants"
+            params = {"hugoSymbolA": a, "hugoSymbolB": b,
+                      "structuralVariantType": alteration.upper(), "isFunctionalFusion": "true"}
+        else:  # mutation (default)
+            url = f"{base}/annotate/mutations/byProteinChange"
+            params = {"hugoSymbol": hugo_symbol, "alteration": alteration}
+        r = requests.get(url, params=params, headers=headers, timeout=_TIMEOUT)
+        r.raise_for_status()
+        d = r.json()
+    except Exception as e:  # noqa: BLE001
+        return f"OncoKB lookup failed ({change}, {'prod' if token else 'demo'}): {e}"
+    onc = d.get("oncogenic", "Unknown")
+    eff = (d.get("mutationEffect") or {}).get("knownEffect", "")
+    txs = []
+    for t in d.get("treatments", [])[:6]:
+        drugs = ", ".join(dr.get("drugName", "") for dr in t.get("drugs", []))
+        lvl = t.get("level", "")
+        inds = "; ".join(t.get("indications", []) or t.get("approvedIndications", []) or [])
+        txs.append(f"{drugs} (level {lvl}) {inds}".strip())
+    return json.dumps({"oncogenic": onc, "mutationEffect": eff, "change": change,
+                       "treatments": txs or ["none reported at this endpoint"],
+                       "endpoint": "prod" if token else "demo"})
+
+
+# --- faithful PubMed: restore the (search-terms list, query) signature ----
+def pubmed_search_faithful(pubmed_search_terms, query: str = "") -> str:
+    """Port of the original query_pubmed(pubmed_search_terms, query): only the first three
+    search terms are used to fetch articles (per the original docstring), then the final query
+    is appended for relevance."""
+    terms = pubmed_search_terms if isinstance(pubmed_search_terms, list) else [pubmed_search_terms]
+    terms = [str(t) for t in terms if str(t).strip()][:3]
+    combined = " OR ".join(f"({t})" for t in terms) if terms else (query or "")
+    if query and terms:
+        combined = f"({combined}) AND ({query})"
+    return pubmed_search(combined or query)
+
+
+# --- faithful calculate: restore the (a, b, operator) signature ----
+def calculate_faithful(a: float, b: float, operator: str) -> str:
+    """Port of the original calculate(a, b, operator): +, -, *, / on two numbers."""
+    try:
+        a = float(a)
+        b = float(b)
+    except (TypeError, ValueError):
+        return "Invalid operands. Provide numeric a and b."
+    if operator == "+":
+        return f"The sum of {a} and {b} is {a + b}."
+    if operator == "-":
+        return f"Subtracting {a} and {b} (a-b) is {a - b}."
+    if operator == "*":
+        return f"Multiplying {a} and {b} is {a * b}."
+    if operator == "/":
+        if b == 0:
+            return "Division by zero is undefined."
+        return f"The ratio between {a} and {b} is {a / b}."
+    return "Invalid operator. Please use one of the following: +, -, *, /."
+
+
+# --- faithful radiology: restore the folder-of-images multi-image compare ----
+def radiology_report_folder(image_paths: list[str], query: str = "",
+                            model: str = "gpt-5.1") -> str:
+    """Port of the original gen_radiology_report(path_to_img_folder, query): read EACH image in
+    the patient's folder separately, then — when more than one is present — run a comparison
+    pass over all of them (the original's single-vision then multi-vision two-stage flow). Our
+    folder is the case's resolved image set."""
+    if not image_paths:
+        return "No images found in the provided folder."
+    out = ""
+    for p in image_paths:
+        name = Path(p).name
+        rep = radiology_report(p, query, model=model)
+        out += f"Radiology Report for {name}\n{rep}\n\n" + "*" * 10 + "\n\n"
+    if len(image_paths) > 1:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            content = [{"type": "text", "text": (
+                "You are a board-certified radiologist. Compare the following medical images "
+                "of the same patient across timepoints. Describe any change in measurable "
+                "lesions (size/number/location) and give an overall impression of "
+                "progression, stability, or response.")}]
+            for p in image_paths:
+                content.append({"type": "image_url",
+                                "image_url": {"url": _data_url(p)}})
+            resp = client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": content}],
+                max_completion_tokens=1200)
+            out += "Radiology Report for comparing images\n" + (resp.choices[0].message.content or "")
+        except Exception as e:  # noqa: BLE001
+            out += f"Radiology comparison failed: {e}"
+    return out
+
+
+# --- faithful histology REPLAY: return the paper's pre-extracted predictions ----
+# Packaged default lookup (the ferber20 cases, extracted from the public paper supplementary).
+# Override with the HISTOLOGY_LOOKUP env var to point at your own lookup JSON.
+_HISTOLOGY_LOOKUP_DEFAULT = Path(__file__).resolve().parent / "data" / "histology_lookup.json"
+
+
+@functools.lru_cache(maxsize=1)
+def _histology_lookup() -> dict:
+    """Load the per-case MSI/KRAS/BRAF prediction lookup, keyed by case surname.
+
+    Resolution order: the ``HISTOLOGY_LOOKUP`` env var if it points at an existing file,
+    otherwise the lookup bundled with the package (``ferber_agent/data/histology_lookup.json``,
+    built from the paper supplementary by ``scripts/build_histology_lookup.py``)."""
+    env_path = os.environ.get("HISTOLOGY_LOOKUP")
+    path = Path(env_path) if env_path else _HISTOLOGY_LOOKUP_DEFAULT
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def histology_replay(case_key: str, targets=None) -> str:
+    """Replay the paper's check_mutations predictions for ``case_key`` (the case surname).
+
+    The original ran proprietary H&E classifiers (never released). The paper states it
+    pre-extracted those predictions for convenience; we replay the documented per-case
+    MSI/KRAS/BRAF (label, probability) from the supplementary. Returns an explicit gap message
+    when a case has no documented prediction."""
+    lut = _histology_lookup()
+    rec = (lut.get("cases") or {}).get(case_key) if "cases" in lut else lut.get(case_key)
+    if not rec or not rec.get("available", True) or not rec.get("predictions"):
+        return (f"No histology-based genetic prediction is documented for this case "
+                f"({case_key}). Use the molecular/genomic report for mutation and MSI status.")
+    preds = rec["predictions"]
+    want = None
+    if targets:
+        tl = targets if isinstance(targets, list) else [str(targets)]
+        want = {str(t).strip().upper() for chunk in tl for t in str(chunk).split(",")}
+    out = "Genetic predictions from histopathology images:\n"
+    out += "*" * (len(out) - 1) + "\n"
+    for marker in ("MSI", "KRAS", "BRAF"):
+        if marker not in preds:
+            continue
+        if want and marker not in want:
+            continue
+        p = preds[marker]
+        out += f"Target is {marker}:\n"
+        out += f"prediction: {p.get('label', 'n/a')}\n"
+        if p.get("probability") is not None:
+            out += f"probability: {p['probability']}\n"
+        out += "\n"
+    return out.strip() or (f"No requested targets documented for {case_key}.")
+
+
+# --- faithful OpenAI tool schemas (verbatim descriptions, restored params) ----
+def faithful_tool_schemas(enabled: tuple[str, ...]) -> list[dict]:
+    """Schemas whose ``description`` is the VERBATIM original docstring and whose parameters
+    match the original signatures. Internal names stay modern for Table-1 mapping."""
+    schemas = {
+        "oncokb": {"type": "function", "function": {
+            "name": "oncokb", "description": _fp.TOOL_ONCOKB_DOC,
+            "parameters": {"type": "object", "properties": {
+                "hugo_symbol": {"type": "string"},
+                "change": {"type": "string", "enum": ["mutation", "amplification", "variant"]},
+                "alteration": {"type": "string"}},
+                "required": ["hugo_symbol", "change", "alteration"]}}},
+        "pubmed": {"type": "function", "function": {
+            "name": "pubmed", "description": _fp.TOOL_PUBMED_DOC,
+            "parameters": {"type": "object", "properties": {
+                "pubmed_search_terms": {"type": "array", "items": {"type": "string"}},
+                "query": {"type": "string"}},
+                "required": ["pubmed_search_terms", "query"]}}},
+        "calculate": {"type": "function", "function": {
+            "name": "calculate", "description": _fp.TOOL_CALCULATE_DOC,
+            "parameters": {"type": "object", "properties": {
+                "a": {"type": "number"}, "b": {"type": "number"},
+                "operator": {"type": "string", "enum": ["+", "-", "*", "/"]}},
+                "required": ["a", "b", "operator"]}}},
+        "radiology_report": {"type": "function", "function": {
+            "name": "radiology_report", "description": _fp.TOOL_RADIOLOGY_DOC,
+            "parameters": {"type": "object", "properties": {
+                "path_to_img_folder": {"type": "string"},
+                "query": {"type": "string"}},
+                "required": ["path_to_img_folder", "query"]}}},
+        "medsam": {"type": "function", "function": {
+            "name": "medsam", "description": _fp.TOOL_SEGMENT_DOC,
+            "parameters": {"type": "object", "properties": {
+                "path_to_img": {"type": "string"},
+                "bbox_coordinates": {"type": "array",
+                    "items": {"type": "array", "items": {"type": "number"}}}},
+                "required": ["path_to_img", "bbox_coordinates"]}}},
+        "histology_classifier": {"type": "function", "function": {
+            "name": "histology_classifier", "description": _fp.TOOL_CHECKMUTATIONS_DOC,
+            "parameters": {"type": "object", "properties": {
+                "patient_id": {"type": "string"},
+                "targets": {"type": "array", "items": {"type": "string"}}},
+                "required": ["patient_id"]}}},
+    }
+    return [schemas[t] for t in enabled if t in schemas]
 
 
 # --- OpenAI tool schemas -----------------------------------------------------

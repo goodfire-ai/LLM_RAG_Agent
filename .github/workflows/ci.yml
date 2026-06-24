@@ -2,8 +2,9 @@ name: ci
 
 # Runs on a CLEAN checkout (committed files only), so a missing source file or a broken
 # import surfaces here rather than in a fresh clone. Heavy deps (torch / transformers for
-# medsam, the live OpenAI/Chroma smoke) cannot run on a CPU CI runner; the offline tool
-# tests + import + ruff are the meaningful regression guard for the package surface.
+# medsam, the live OpenAI/Chroma smoke) cannot run on a CPU CI runner; the offline tests
+# (tools, faithful pipeline, serial-vs-parallel equivalence, prompt fidelity) + import +
+# ruff are the meaningful regression guard for the package surface.
 on:
   push:
     branches: [main, "agent/**"]
@@ -19,11 +20,16 @@ jobs:
           python-version: "3.12"
       - name: Install light test deps
         # tools.py needs requests; agent.py/chromadb/openai/cohere/torch are lazy-imported,
-        # so the offline tool tests run without the heavy/imaging/rerank extras.
+        # so the offline tests run without the heavy/imaging/rerank extras.
         run: pip install pytest ruff requests
       - name: Import the package from the committed tree
-        run: PYTHONPATH=. python -c "import ferber_agent, ferber_agent.tools, ferber_agent.agent; print('import OK')"
+        run: PYTHONPATH=. python -c "import ferber_agent, ferber_agent.tools, ferber_agent.agent, ferber_agent.faithful_prompts; print('import OK')"
       - name: Lint
-        run: ruff check ferber_agent tests
-      - name: Offline tool tests
-        run: PYTHONPATH=. pytest tests/test_tools.py -q
+        run: ruff check ferber_agent tests scripts
+      - name: Offline tests (tools, faithful pipeline, equivalence, prompt fidelity)
+        run: >
+          PYTHONPATH=. pytest -q
+          tests/test_tools.py
+          tests/test_faithful_pipeline.py
+          tests/test_equivalence.py
+          tests/test_prompt_fidelity.py

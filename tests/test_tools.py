@@ -86,3 +86,57 @@ def test_oncokb_endpoint_selection(monkeypatch):
     # calculate is pure; oncokb is exercised live in the smoke. Just assert the function
     # exists and is callable with the expected signature.
     assert callable(tools.oncokb_annotate)
+
+
+# --- faithful-mode tools -----------------------------------------------------
+def test_faithful_tool_schemas_use_verbatim_descriptions_and_restored_params():
+    from ferber_agent import faithful_prompts as fp
+
+    enabled = ("oncokb", "pubmed", "calculate", "radiology_report", "medsam",
+               "histology_classifier")
+    schemas = {s["function"]["name"]: s["function"] for s in tools.faithful_tool_schemas(enabled)}
+    assert set(schemas) == set(enabled)
+
+    # descriptions are the byte-verbatim upstream docstrings
+    assert schemas["oncokb"]["description"] == fp.TOOL_ONCOKB_DOC
+    assert schemas["pubmed"]["description"] == fp.TOOL_PUBMED_DOC
+    assert schemas["calculate"]["description"] == fp.TOOL_CALCULATE_DOC
+    assert schemas["medsam"]["description"] == fp.TOOL_SEGMENT_DOC
+    assert schemas["histology_classifier"]["description"] == fp.TOOL_CHECKMUTATIONS_DOC
+
+    # restored original parameter shapes
+    assert schemas["oncokb"]["parameters"]["properties"]["change"]["enum"] == \
+        ["mutation", "amplification", "variant"]
+    assert schemas["pubmed"]["parameters"]["properties"]["pubmed_search_terms"]["type"] == "array"
+    assert set(schemas["calculate"]["parameters"]["properties"]) == {"a", "b", "operator"}
+    bbox = schemas["medsam"]["parameters"]["properties"]["bbox_coordinates"]
+    assert bbox["type"] == "array" and bbox["items"]["type"] == "array"  # nested list
+
+
+def test_calculate_faithful_operators():
+    assert "4.0" in tools.calculate_faithful(120, 30, "/")
+    assert "undefined" in tools.calculate_faithful(1, 0, "/").lower()
+    assert "150" in tools.calculate_faithful(120, 30, "+")
+    assert "Invalid operator" in tools.calculate_faithful(1, 2, "^")
+    assert "Invalid operands" in tools.calculate_faithful("x", 2, "+")
+
+
+def test_pubmed_search_faithful_uses_first_three_terms(monkeypatch):
+    captured = {}
+
+    def fake_pubmed(query, k=4):
+        captured["query"] = query
+        return "stub"
+
+    monkeypatch.setattr(tools, "pubmed_search", fake_pubmed)
+    tools.pubmed_search_faithful(["t1", "t2", "t3", "t4"], "final question")
+    # only the first three terms are used (per the original docstring), AND-ed with the query
+    assert "t1" in captured["query"] and "t2" in captured["query"] and "t3" in captured["query"]
+    assert "t4" not in captured["query"]
+    assert "final question" in captured["query"]
+
+
+def test_cache_stats_shape():
+    s = tools.cache_stats()
+    for key in ("mem_hit", "disk_hit", "miss", "hit_rate", "retr_total"):
+        assert key in s

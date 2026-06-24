@@ -17,6 +17,9 @@ rerank = ["cohere>=5.0"]
 # dep); medsam needs torch + transformers' SamModel + pillow. Heavy; installed only for the
 # multimodal ferber20 track and lazy-imported at tool-call time.
 imaging = ["torch>=2.0", "transformers>=4.40", "pillow>=10.0"]
+# Only scripts/build_histology_lookup.py needs the Claude SDK; the agent itself does not.
+histology = ["anthropic>=0.40"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [build-system]
 requires = ["hatchling"]
@@ -24,3 +27,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ferber_agent"]
+
+# Ship the bundled histology replay lookup (default data consumed by histology_replay).
+[tool.hatch.build.targets.wheel.force-include]
+"ferber_agent/data/histology_lookup.json" = "ferber_agent/data/histology_lookup.json"
