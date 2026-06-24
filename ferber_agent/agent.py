@@ -66,6 +66,7 @@ from .tools import (
     pubmed_search_faithful,
     radiology_report,
     radiology_report_folder,
+    rerank_passages,
     resolve_image,
     tool_schemas,
     web_search,
@@ -270,9 +271,14 @@ class FerberAgent:
         return tuple(base)
 
     def _retrieve(self, query: str) -> list[dict]:
-        """Single-query retrieval via the configured engine."""
-        return self._engine.retrieve(query, retrieve_k=self.retrieve_k,
-                                     top_n=self.rerank_top_n, usage=self._usage)
+        """Single-query retrieval for default mode and the native-arm ``rag`` tool: chroma cosine
+        over ``self._rag`` (all ``retrieve_k`` hits), then Cohere rerank when enabled. This keeps
+        the compact / native paths byte-identical to the pre-switch behavior; the pluggable
+        ``retrieval_engine`` governs faithful Stage-2 retrieval (see ``_retrieve_subqueries``)."""
+        hits = self._rag.query(query)
+        if self.rerank:
+            hits = rerank_passages(query, hits, top_n=self.rerank_top_n)
+        return hits
 
     def _retrieve_subqueries(self, subqueries: list[str]) -> list[dict]:
         """Retrieve per subquery via the configured engine, fanned out across the thread pool,
